@@ -116,9 +116,10 @@ class UpsampleMask4x(nn.Module):
                                          nn.ReLU(inplace=False),
                                          nn.ConvTranspose2d(128, 9, kernel_size=2, stride=2))
 
-    def forward(self, feat_x: torch.Tensor, feat_y: torch.Tensor):
+    def forward(self, feat_x: torch.Tensor, feat_y: torch.Tensor, feat_y_done: bool = False):
         feat_x = self.conv_x(feat_x)
-        feat_y = self.conv_y(feat_y)
+        if not feat_y_done:   # feat_y = conv_y(feature) already (applied early, see S2M2.forward)
+            feat_y = self.conv_y(feat_y)
         upmask = self.conv_concat(torch.cat([feat_x, feat_y], dim=1))
 
         return upmask
@@ -143,10 +144,10 @@ class UpsampleMask1x(nn.Module):
                                          nn.ReLU(inplace=False),
                                          nn.ConvTranspose2d(48, 9, kernel_size=1))
 
-    def forward(self, disp: torch.Tensor, rgb: torch.Tensor, ctx: torch.Tensor):
+    def forward(self, disp: torch.Tensor, rgb: torch.Tensor, ctx: torch.Tensor, ctx_done: bool = False):
         feat_disp = self.conv_disp(disp)
         feat_rgb = self.conv_rgb(rgb)
-        feat_ctx = self.conv_ctx(ctx)
+        feat_ctx = ctx if ctx_done else self.conv_ctx(ctx)
 
         feat_cat = torch.cat([feat_disp, feat_rgb, feat_ctx], dim=1)
         mask = self.conv_concat(feat_cat)

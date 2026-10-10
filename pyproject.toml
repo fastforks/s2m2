@@ -16,3 +16,6 @@ requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"s2m2.core.model" = ["*.cu", "prebuilt/*.so", "prebuilt/*.fatbin"]

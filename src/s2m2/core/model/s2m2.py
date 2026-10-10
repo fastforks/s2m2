@@ -9,6 +9,7 @@ from .feature_fusion import FeatureFusion
 from .unet import Unet
 from .refinenet import LocalRefiner, GlobalRefiner
 from .utils import custom_unfold
+from .fast_dispatch import fast_forward
 
 class S2M2(nn.Module):
     def __init__(self,
@@ -136,6 +137,10 @@ class S2M2(nn.Module):
     def forward(self,
                 img0: Tensor,
                 img1: Tensor):
+        # optional fast eager path (custom kernels); None under export / tracing / training or without the kernels
+        out = fast_forward(self, img0, img1)
+        if out is not None:
+            return out
 
         img0_nor, img1_nor = self.normalize_img(img0, img1)
 
