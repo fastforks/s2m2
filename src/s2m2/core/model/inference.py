@@ -51,7 +51,9 @@ _INPLACE_ATTN = (
 )  # row-attention blocks write their strips back in place
 # low-memory mode for very large inputs (exact; slower GRU): ConvGRU in row strips instead of full-size fused buffers.
 # "auto": when one image's 1/4-res C-channel map exceeds LOWMEM_MB (XL: > ~16 MP input)
-_ATTN384 = os.environ.get("S2M2_ATTN384", "1") == "1"   # fused flash-style kernel for head_dim 384 (XL level 0)
+_ATTN384 = (
+    os.environ.get("S2M2_ATTN384", "1") == "1"
+)  # fused flash-style kernel for head_dim 384 (XL level 0)
 _LOWMEM = os.environ.get("S2M2_LOWMEM", "auto")
 LOWMEM_BYTES = int(float(os.environ.get("S2M2_LOWMEM_MB", "768")) * 2**20)
 _LM = [False]
@@ -1480,8 +1482,16 @@ def _local_refiner_forward(self, hidden, ctx, disp, conf, occ, cv_fn):
 # ------------------------------------------------------------------------------------------------ upsampling
 def _convex_kernel(X, mask, f):
     b, c, h, w = X.shape
-    if not (_OPT["kern"] and b == 1 and X.dtype == torch.float32 and X.is_contiguous() and mask.dtype == torch.half
-            and mask.shape[1] == 9 and mask.is_contiguous(memory_format=CL) and tuple(mask.shape[2:]) == (f * h, f * w)):
+    if not (
+        _OPT["kern"]
+        and b == 1
+        and X.dtype == torch.float32
+        and X.is_contiguous()
+        and mask.dtype == torch.half
+        and mask.shape[1] == 9
+        and mask.is_contiguous(memory_format=CL)
+        and tuple(mask.shape[2:]) == (f * h, f * w)
+    ):
         return None
     out = torch.empty((1, c, f * h, f * w), device=X.device)
     k = kern()
@@ -1560,11 +1570,20 @@ def _upmask1_forward(self, disp, rgb, ctx, ctx_done=False):
 
 # ------------------------------------------------------------------------------------------------ model
 def forward_fast(self, img0, img1, full_outputs=True):
-    """img0/img1 [1,3,H,W] float 0..255 (padded /32). Returns (disp, occ, conf) [1,1,H,W] fp32 (occ/conf None if
-    not full_outputs)."""
-    if img0.shape[0] != 1 or img1.shape != img0.shape or img0.shape[1] != 3 or img0.shape[-2] % 32 or img0.shape[-1] % 32:
-        raise ValueError(f"forward_fast: expects two [1, 3, H, W] images with H, W divisible by 32 (image_pad(x, 32)); "
-                         f"got {tuple(img0.shape)} / {tuple(img1.shape)} (batch > 1: call once per pair)")
+    """Padded [1,3,H,W] RGB inputs, values 0..255; return fp32 (disp, occ, conf).
+    With full_outputs=False, only disparity is computed and the other outputs are None.
+    """
+    if (
+        img0.shape[0] != 1
+        or img1.shape != img0.shape
+        or img0.shape[1] != 3
+        or img0.shape[-2] % 32
+        or img0.shape[-1] % 32
+    ):
+        raise ValueError(
+            f"forward_fast: expects two [1, 3, H, W] images with H, W divisible by 32 (image_pad(x, 32)); "
+            f"got {tuple(img0.shape)} / {tuple(img1.shape)} (batch > 1: call once per pair)"
+        )
     C = self.feature_channels
     _LM[0] = _LOWMEM == "1" or (
         _LOWMEM == "auto" and C * (img0.shape[-2] // 4) * (img0.shape[-1] // 4) * 2 > LOWMEM_BYTES

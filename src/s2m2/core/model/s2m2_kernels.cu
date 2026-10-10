@@ -358,7 +358,7 @@ extern "C" __global__ void affine_nc8(__half* x, const float* __restrict__ s, co
 }
 
 // convex upsampling (S2M2 UpsampleMask4x / 1x): out[c, Y, X] = sum_k softmax_k(mask[k, Y, X]) * Xp[c, Y/f + ky, X/f + kx]
-// with Xp = replicate-padded X (fp32 [c, h, w]), mask fp16 NHWC [H, W, 9] (H = f*h), out fp32 [c, H, W]; f = 4 or 1
+// with Xp = replicate-padded X (fp32 [c, h, w]), mask fp16 NHWC [H, W, 9] (H = f*h), out fp32 [c, H, W]; f = 4 or 1.
 extern "C" __global__ void convex_up(const float* __restrict__ X, const __half* __restrict__ mask, float* __restrict__ out,
                                      int c, int h, int w, int f) {
     const int H = h * f, W = w * f;
