@@ -39,7 +39,21 @@ class SelfAttn(nn.Module):
         k = self.k(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if self.use_pe:
+        if self.use_pe and isinstance(pe, (tuple, list)):
+            # relative PE from 1D tables (utils.get_pe_tables): pe[i, j] = [Tx[x_i, x_j], Ty[y_i, y_j]], so
+            # sum_j attn[i, j] pe[i, j] = [sum_xj mx[i, xj] Tx[x_i, xj], sum_yj my[i, yj] Ty[y_i, yj]] with the attention
+            # marginals mx / my over the key columns / rows: same values, no [N, N, 32] tensor (2.1 GB at 6 MP)
+            Tx, Ty, h, w = pe
+            Hh = self.num_heads
+            score = torch.einsum('...ic, ...jc -> ...ij', scale * q, k)  # B num_head N N
+            attn = score.reshape(B, Hh, N, N).softmax(dim=-1)
+            out = torch.einsum('...ij, ...jc -> ...ic', attn, v)
+            a5 = attn.reshape(B, Hh, N, h, w)
+            mx, my = a5.sum(3), a5.sum(4)                                 # [B, Hh, N, w], [B, Hh, N, h]
+            pex = torch.matmul(mx.reshape(B * Hh * h, w, 1, w), Tx.to(mx.dtype)[None]).reshape(B, Hh, N, -1)
+            pey = torch.matmul(my.reshape(B * Hh, h, w, h), Ty.to(my.dtype)[None]).reshape(B, Hh, N, -1)
+            out = out + self.pe_proj(torch.cat([pex, pey], -1))
+        elif self.use_pe:
             score = torch.einsum('...ic, ...jc -> ...ij', scale * q, k)  # B num_head N N
             attn = score.reshape(B, self.num_heads, N, N).softmax(dim=-1)
             out = torch.einsum('...ij, ...jc -> ...ic', attn, v)

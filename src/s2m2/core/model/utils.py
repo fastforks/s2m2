@@ -58,3 +58,19 @@ def get_pe(h: int, w: int, pe_dim: int, dtype: str, device: str):
         pe = .5*torch.cat([rel_pe_x, rel_pe_y], dim=2)
 
     return pe.clone()
+
+
+def get_pe_tables(h, w, pe_dim: int, device):
+    """the relative PE of get_pe as two 1D tables: Tx[x_i, x_j, :] = get_pe(...)[i, j, :pe_dim/2] for i = (y_i, x_i),
+    j = (y_j, x_j), Ty likewise for the y half; h, w may be symbolic. Returns (Tx [w, w, pe_dim/2], Ty [h, h, pe_dim/2], h, w)."""
+    sig = 5 / pe_dim
+    dim_t = torch.linspace(-1, 1, pe_dim // 2, device=device, dtype=torch.float32)
+
+    def table(n):
+        i = torch.arange(n, device=device, dtype=torch.float32)
+        k = (i[:, None] - i[None, :]) + (n - 1)
+        pos = torch.tanh(-3 + k * (3.0 / n))
+        v = custom_sinc((dim_t - pos[..., None]) / sig)
+        return 0.5 * F.normalize(v, p=2, dim=-1)
+
+    return table(w), table(h), h, w

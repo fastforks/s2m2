@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch import Tensor
 from .attentions import GlobalAttnBlock, ConvBlock2D
 from .feature_fusion import FeatureFusion
-from .utils import get_pe
+from .utils import get_pe_tables
 
 
 class Unet(nn.Module):
@@ -66,7 +66,7 @@ class Unet(nn.Module):
         # z: [B, C, H, W]
         if self.use_pe:
             H,W = z.shape[-2:]
-            pe = get_pe(H//8, W//8, 32, z.dtype, z.device)
+            pe = get_pe_tables(H//8, W//8, 32, z.device)   # == get_pe(H//8, W//8, 32, ...) as 1D tables
         else:
             pe=None
 

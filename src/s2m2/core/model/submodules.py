@@ -7,8 +7,8 @@ from torch import Tensor
 def bilinear_sampler(img, coords, mode='bilinear'):
     """ Wrapper for grid_sample, uses pixel coordinates """
     # grid in fp32: in fp16 the normalised coordinates are off by up to ~0.1 px / row at w ~ 370
-    W = torch.tensor(img.shape[-1], dtype=torch.float32, device=img.device)
-    H = torch.tensor(img.shape[-2], dtype=torch.float32, device=img.device)
+    W = img.shape[-1]   # python / symbolic ints (torch.tensor(shape) would bake the size into an export)
+    H = img.shape[-2]
     xgrid, ygrid = coords.float().split([1,1], dim=-1)
     # sample x at x * W / (W - 1) - 0.5: the lookup the released weights were trained with
     # (before cb59d61: x normalised by (W - 1) and sampled with align_corners=False)
@@ -190,7 +190,7 @@ class DispInit(nn.Module):
         bs, h, w, _ = attn.shape
         dtype = attn.dtype
         # set marginal to be uniform distribution
-        marginal = torch.cat([torch.ones([w], device=attn.device), torch.tensor([w], device=attn.device)]) / (2 * w)
+        marginal = torch.cat([torch.ones([w], device=attn.device), torch.ones([1], device=attn.device) * w]) / (2 * w)
         log_mu = marginal.log().reshape(1, 1, w + 1)
         log_nu = marginal.log().reshape(1, 1, w + 1)
 
@@ -201,8 +201,7 @@ class DispInit(nn.Module):
         # sinkhorn
         attn = self._sinkhorn(attn, log_mu, log_nu)
         # convert back from log space, recover probabilities by normalization 2W
-        w_tensor = torch.tensor(w, dtype=torch.float32,device=attn.device)
-        log_const = torch.log(2*w_tensor)
+        log_const = torch.log(torch.ones([], dtype=torch.float32, device=attn.device) * (2 * w))
         attn = (attn[:, :, :-1, :-1].float() + log_const).exp()
         return attn
 
@@ -213,7 +212,7 @@ class DispInit(nn.Module):
         dtype = feature.dtype
         device = feature.device
         w = feature.shape[-1]
-        x_grid = torch.linspace(0, w - 1, w, device=device, dtype=torch.float32)
+        x_grid = torch.arange(w, device=device, dtype=torch.float32)
         if self.use_positivity:
             mask = torch.triu(torch.ones((w, w), dtype=torch.bool, device=device), diagonal=1)
         else:
