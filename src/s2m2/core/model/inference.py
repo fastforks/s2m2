@@ -45,7 +45,7 @@ OT_BYTES = 512 * 2**20  # working-set budget of one optimal-transport row chunk
 # on-the-fly cost volume (no [h, w, w] correlation volume): "1" always, "0" never, "auto": when the volume would exceed
 # CV_OTF_BYTES (the lookup path then keeps the two LayerNormed feature maps, 2*h*w*C fp16, instead of h*w*w fp16)
 _CV_OTF = os.environ.get("S2M2_CV_OTF", "auto")
-CV_OTF_BYTES = int(float(os.environ.get("S2M2_CV_OTF_MB", "1024")) * 2**20)
+CV_OTF_BYTES = int(float(os.environ.get("S2M2_CV_OTF_MB", "256")) * 2**20)
 _INPLACE_ATTN = (
     os.environ.get("S2M2_INPLACE_ATTN", "1") == "1"
 )  # row-attention blocks write their strips back in place
