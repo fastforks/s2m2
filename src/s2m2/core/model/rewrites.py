@@ -42,18 +42,9 @@ def tconv_as_conv(t):
     return c
 
 
-def prepare(model, onehot=False, upconv=True, tconv=True, relpe=True):
-    from s2m2.core.model import unet as unet_mod, attentions as att
-    n = dict(relpe=0, upconv=0, tconv=0)
-    if relpe:
-        def get_pe_tables(h, w, pe_dim, dtype, device):
-            Tx, Ty = pe_tables(h, w, pe_dim, device)
-            return PE((Tx, Ty, h, w))
-        unet_mod.get_pe = get_pe_tables
-        for m in model.modules():
-            if isinstance(m, att.SelfAttn) and m.use_pe:
-                m.forward = types.MethodType(lambda self, x, pe=None: selfattn_forward(self, x, pe, onehot), m)
-                n["relpe"] += 1
+def prepare(model, upconv=True, tconv=True):
+    """Apply supported algebraic rewrites after loading weights; return replacement counts."""
+    n = dict(upconv=0, tconv=0)
     for parent in list(model.modules()):
         for name, c in list(parent.named_children()):
             if (
