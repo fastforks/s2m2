@@ -42,7 +42,30 @@ _RELPE_FLASH = (
     os.environ.get("S2M2_RELPE_FLASH", "1") == "1"
 )  # rel-PE attention as one flash call with one-hot values  # row attention per image strip (no strip copies)   # explicit (head_dim > 256) attention GEMMs with fp16 accumulation
 OT_BYTES = 512 * 2**20  # working-set budget of one optimal-transport row chunk
-ATTN_BYTES = 256 * 2**20     # budget of one explicit (relative-PE) attention score chunk
+# on-the-fly cost volume (no [h, w, w] correlation volume): "1" always, "0" never, "auto": when the volume would exceed
+# CV_OTF_BYTES (the lookup path then keeps the two LayerNormed feature maps, 2*h*w*C fp16, instead of h*w*w fp16)
+_CV_OTF = os.environ.get("S2M2_CV_OTF", "auto")
+CV_OTF_BYTES = int(float(os.environ.get("S2M2_CV_OTF_MB", "1024")) * 2**20)
+_INPLACE_ATTN = (
+    os.environ.get("S2M2_INPLACE_ATTN", "1") == "1"
+)  # row-attention blocks write their strips back in place
+# low-memory mode for very large inputs (exact; slower GRU): ConvGRU in row strips instead of full-size fused buffers.
+# "auto": when one image's 1/4-res C-channel map exceeds LOWMEM_MB (XL: > ~16 MP input)
+_ATTN384 = os.environ.get("S2M2_ATTN384", "1") == "1"   # fused flash-style kernel for head_dim 384 (XL level 0)
+_LOWMEM = os.environ.get("S2M2_LOWMEM", "auto")
+LOWMEM_BYTES = int(float(os.environ.get("S2M2_LOWMEM_MB", "768")) * 2**20)
+_LM = [False]
+GRU_STRIP_BYTES = 128 * 2**20
+_INPLACE_CB = (
+    os.environ.get("S2M2_INPLACE_CB", "1") == "1"
+)  # Unet ConvBlock2D strips written back in place
+_INPLACE_BB = (
+    os.environ.get("S2M2_INPLACE_BB", "1") == "1"
+)  # backbone conv2 block written back in place (exact)
+CV_CHUNK_BYTES = (
+    256 * 2**20
+)  # correlation rows materialized at a time for the optimal transport (on-the-fly mode)
+ATTN_BYTES = 256 * 2**20  # budget of one explicit (relative-PE) attention score chunk
 
 
 def _cl(x):
@@ -290,6 +313,46 @@ def strips(fn, xs, halo, per_image=False):
     return out
 
 
+def strips_inplace(fn, x, halo):
+    """x = fn(x) for a local block (receptive field +-halo rows, C_out == C_in) in row strips written back into x: the
+    original halo rows above each strip are saved before they are overwritten (no second full-size map). Same strip
+    inputs as strips() -> same result."""
+    N, C, H, W = x.shape
+    rows = max(8, STRIP_BYTES // (N * C * W * x.element_size()))
+    if H <= rows + 2 * halo:
+        return fn(x)
+    prev = None  # original rows [r0 - halo, r0)
+    for r0 in range(0, H, rows):
+        r1 = min(H, r0 + rows)
+        cur = x[:, :, r0 : min(H, r1 + halo)]
+        y = fn(cur if prev is None else torch.cat([prev, cur], 2))
+        top = 0 if prev is None else prev.shape[2]
+        prev = x[:, :, max(r0, r1 - halo) : r1].clone() if r1 < H else None
+        x[:, :, r0:r1] = y[:, :, top : top + r1 - r0]
+        del y
+    return x
+
+
+def strips_into_inplace(fn, x, halo):
+    """strips_into(fn, [x], halo, C) writing each image's result rows back into x (C_out == C_in): the original halo
+    rows above a strip are saved before they are overwritten; fn reads its strip input before writing dst."""
+    N, C, H, W = x.shape
+    rows = max(8, STRIP_BYTES // (C * W * x.element_size())) * N
+    if H <= rows + 2 * halo:
+        rows = H
+    for i in range(N):
+        prev = None
+        for r0 in range(0, H, rows):
+            r1 = min(H, r0 + rows)
+            cur = x[i : i + 1, :, r0 : min(H, r1 + halo)]
+            inp = cur if prev is None else torch.cat([prev, cur], 2)
+            top = 0 if prev is None else prev.shape[2]
+            prev = x[i : i + 1, :, max(r0, r1 - halo) : r1].clone() if r1 < H else None
+            fn([inp], top, r1 - r0, x[i : i + 1, :, r0:r1])
+            del inp, cur
+    return x
+
+
 def strips_into(fn, xs, halo, cout):
     """per-image row strips (as strips(..., per_image=True)) for blocks that write their result rows straight into the
     output: fn(strip_xs, top, nrows, dst) writes rows [top, top + nrows) of the strip's result into dst (a dense
@@ -508,6 +571,18 @@ def _ff_core(self, z0, z1):
 
 def _convblock_forward(self, z):
     l1 = self.convs_1x[2]
+    if (
+        _OPT["cut"]
+        and getattr(l1, "_cut_res", False)
+        and hasattr(l1, "_b32")
+        and _INPLACE_CB
+        and l1.weight.shape[0] == z.shape[1]
+        and z.is_contiguous(memory_format=CL)
+    ):
+        # in place (no call site reuses a ConvBlock2D input: Unet enc*/dec* get temporaries)
+        return strips_into_inplace(
+            lambda t, top, n, dst: _convblock_core_into(self, _cl(t[0]), top, n, dst), z, 2
+        )
     if _OPT["cut"] and getattr(l1, "_cut_res", False) and hasattr(l1, "_b32"):
         return strips_into(
             lambda t, top, n, dst: _convblock_core_into(self, _cl(t[0]), top, n, dst),
@@ -552,6 +627,10 @@ def sdpa(q, k, v, out=None):
         if out is not None:
             out.copy_(o.transpose(1, 2).reshape(out.shape))
         return o
+    if _ATTN384 and _OPT["kern"] and q.shape[-1] == 384 and q.dtype == torch.half and q.is_cuda:
+        y = _attn384(q, k, v, out)
+        if y is not False:
+            return y
     mm = torch.backends.cuda.matmul
     prev = mm.allow_fp16_accumulation
     mm.allow_fp16_accumulation = (
@@ -580,6 +659,47 @@ def sdpa(q, k, v, out=None):
         return o
     finally:
         mm.allow_fp16_accumulation = prev
+
+
+def _attn384(q, k, v, out=None):
+    """attn_d384 kernel (s2m2_kernels.cu, flash-style, fp16-accumulate MMAs) on [n, H, L, 384] strided views sharing
+    strides (q|k|v slices of one projection, or of two same-shaped ones). Writes out ([n*L, 384] rows, H == 1) or
+    returns o [n, H, L, 384]; False if the layout is not supported."""
+    n, H, L, d = q.shape
+    st = q.stride()
+    if (
+        k.stride() != st
+        or v.stride() != st
+        or st[3] != 1
+        or k.shape != q.shape
+        or v.shape != q.shape
+        or any((t.data_ptr() % 16) or (st[2] % 8) for t in (q, k, v))
+    ):
+        return False
+    if out is not None and H == 1:
+        o, ost, ret = out, (L * d, 0, d), None
+    else:
+        o = torch.empty((n, H, L, d), device=q.device, dtype=q.dtype)
+        ost, ret = o.stride()[:3], o
+    kern().launch(
+        "attn_d384",
+        (((L + 63) // 64, n * H, 1), (128, 1, 1)),
+        q,
+        k,
+        v,
+        o,
+        st[0],
+        st[1],
+        st[2],
+        *ost,
+        H,
+        L,
+        float(d**-0.5),
+        smem=2 * 32 * (384 + 8) * 2,
+    )
+    if out is not None and ret is not None:
+        out.copy_(ret.transpose(1, 2).reshape(out.shape))
+    return ret
 
 
 def _merge(o):
@@ -755,7 +875,9 @@ def _basic_attn_pair_forward(self, z):
     N, C, H, W = z.shape
     z = _cl(z)
     rows = max(8, STRIP_BYTES // (N * C * W * z.element_size()))
-    out = torch.empty_like(z, memory_format=CL)
+    # in place: a strip's output rows depend only on the same input rows, which are fully read (into new tensors) by the
+    # first attention of the strip; no call site reuses the block input (forward_fast keeps its own copy of py4[0])
+    out = z if _INPLACE_ATTN else torch.empty_like(z, memory_format=CL)
     for r0 in range(0, H, rows):
         r1 = min(H, r0 + rows)
         zs = [
@@ -835,7 +957,13 @@ def _unet_forward(self, z):
     return z0n, z1n, z2n, z3
 
 
-def _mrt_forward(self, z0, z1, z2, z3):
+def _mrt_forward(self, z0, z1=None, z2=None, z3=None):
+    if isinstance(
+        z0, list
+    ):  # list input (emptied here): the caller holds no reference, inputs freed as soon as replaced
+        zs = z0
+        z0, z1, z2, z3 = zs
+        zs.clear()
     z0 = self.enc_attn0(z0)
     z1 = self.enc_attn1(ff_down(self.down_concat1, z1, self.down_conv0, z0))
     z2 = self.enc_attn2(ff_down(self.down_concat2, z2, self.down_conv1, z1))
@@ -850,7 +978,15 @@ def _mrt_forward(self, z0, z1, z2, z3):
     return z0, z1, z2, z3
 
 
-def _stacked_forward(self, z0, z1, z2, z3):
+def _stacked_forward(self, z0, z1=None, z2=None, z3=None):
+    if isinstance(
+        z0, list
+    ):  # list input (emptied): no reference to the pyramid kept while the MRTs run
+        zs = list(z0)
+        z0.clear()
+        for u in self.uformer_list:
+            zs = list(u(zs))
+        return zs[0]
     for u in self.uformer_list:
         z0, z1, z2, z3 = u(z0, z1, z2, z3)
     return z0
@@ -950,7 +1086,7 @@ def _encoder_forward(self, x):
         t = _cl(t)
         return run_seq(self.conv2, t, r=t)
 
-    x2 = strips(blk, [x2], 2)
+    x2 = strips_inplace(blk, x2, 2) if _INPLACE_BB else strips(blk, [x2], 2)
     return self.conv2_down(x2), x2
 
 
@@ -959,6 +1095,9 @@ def _dispinit_forward(self, feature):
     """optimal transport per image row (rows are independent problems) in row chunks, fp32 Sinkhorn on the fp16
     correlation (as upstream under autocast); soft-argmax window and disparity in fp32.
     Returns disparity, conf, occ [1,1,h,w] fp32 and the raw correlation [h, w, w] fp16."""
+    assert feature.shape[0] == 2, "batch size 1 only"
+    if _OPT["kern"] and _use_otf(*feature.shape[2:], feature.shape[1]):
+        return _dispinit_otf(self, feature)
     f = F.layer_norm(
         feature.permute(0, 2, 3, 1).contiguous(),
         feature.shape[1:2],
@@ -966,7 +1105,6 @@ def _dispinit_forward(self, feature):
         self.layer_norm.bias,
         self.layer_norm.eps,
     )
-    assert f.shape[0] == 2, "batch size 1 only"
     h, w = f.shape[1:3]
     cv = torch.bmm(f[0], f[1].transpose(1, 2))  # [h, w(left i), w(right j)]
     del f
@@ -1019,7 +1157,49 @@ def _dispinit_forward(self, feature):
     return disp[None, None], conf[None, None], occ[None, None], cv
 
 
-def _ot_kernels(self, cv, h, w):
+def _use_otf(h, w, C):
+    if _CV_OTF == "1":
+        return C in (64, 128, 192, 256, 384, 512)
+    if _CV_OTF == "0":
+        return False
+    return C in (64, 128, 192, 256, 384, 512) and h * w * w * 2 > CV_OTF_BYTES
+
+
+def _dispinit_otf(self, feature):
+    """on-the-fly variant: the LayerNormed features and their correlation are materialized only CV_CHUNK_BYTES worth of
+    rows at a time for the optimal transport (rows are independent; same LayerNorm, cuBLAS GEMM and OT kernels per
+    chunk), and the refinement lookups recompute their few correlations from the raw transformer output (kept anyway
+    for the refiners) + per-pixel LayerNorm statistics (OtfCostVolume)."""
+    _, C, h, w = feature.shape
+    x = feature.permute(0, 2, 3, 1)
+    if not x.is_contiguous():
+        x = x.contiguous()
+    ln = self.layer_norm
+    rows = max(1, min(h, CV_CHUNK_BYTES // (w * w * 2)))
+    buf = torch.empty((rows, w, w), device=x.device, dtype=x.dtype)
+    disp, conf, occ = (torch.empty((h, w), device=x.device) for _ in range(3))
+    ms = torch.empty((2, h, w, 2), device=x.device)
+    for r0 in range(0, h, rows):
+        r1 = min(h, r0 + rows)
+        xc = x[:, r0:r1]
+        f = F.layer_norm(xc, (C,), ln.weight, ln.bias, ln.eps)
+        var, mean = torch.var_mean(xc.float(), dim=-1, unbiased=False)
+        ms[:, r0:r1, :, 0] = mean
+        ms[:, r0:r1, :, 1] = torch.rsqrt(var + ln.eps)
+        del var, mean
+        cv = torch.bmm(f[0], f[1].transpose(1, 2), out=buf[: r1 - r0])
+        del f
+        _ot_kernels(self, cv, r1 - r0, w, (disp[r0:r1], conf[r0:r1], occ[r0:r1]))
+    del buf
+    return (
+        disp[None, None],
+        conf[None, None],
+        occ[None, None],
+        OtfCostVolume(x, ms, ln.weight.float().contiguous(), ln.bias.float().contiguous()),
+    )
+
+
+def _ot_kernels(self, cv, h, w, outs=None):
     """Sinkhorn + soft-argmax as 2 + 2 (ot_iter - 1) + 1 sync-free kernels on the fp16 correlation (s2m2_kernels.cu):
     same fp32 math as the chunked path, no [rows, w+1, w+1] fp32 tensors (~6 passes over 4x the data)."""
     dev = cv.device
@@ -1039,12 +1219,66 @@ def _ot_kernels(self, cv, h, w):
     for _ in range(self.ot_iter - 1):
         k.launch("ot_col_lse", col, cv, u, v, w, pos, lm_a, lm_d)
         k.launch("ot_row_lse", row, cv, v, u, h, w, pos, lm_a, lm_d)
-    disp = torch.empty((h, w), device=dev)
-    conf = torch.empty((h, w), device=dev)
-    occ = torch.empty((h, w), device=dev)
-    k.launch("ot_final", ((((h * w) * 32 + 255) // 256, 1, 1), (256, 1, 1)), cv, u, v, h, w, pos,
-             float(math.log(2 * w)), disp, conf, occ)
+    disp, conf, occ = (
+        outs if outs is not None else (torch.empty((h, w), device=dev) for _ in range(3))
+    )
+    k.launch(
+        "ot_final",
+        ((((h * w) * 32 + 255) // 256, 1, 1), (256, 1, 1)),
+        cv,
+        u,
+        v,
+        h,
+        w,
+        pos,
+        float(math.log(2 * w)),
+        disp,
+        conf,
+        occ,
+    )
     return disp[None, None], conf[None, None], occ[None, None], cv
+
+
+class OtfCostVolume:
+    """FastCostVolume lookups (radius 4) without the [h, w, w] volume (cv_lookup_otf kernel): correlations recomputed
+    from the raw features x [2, h, w, C] fp16 with LayerNorm statistics ms [2, h, w, 2] (mean, rstd) and affine g, b.
+    Same positions / fp16 correlation values / interpolation as FastCostVolume."""
+
+    def __init__(self, x, ms, g, b):
+        self.x, self.ms, self.g, self.b = x, ms, g, b
+        self.h, self.w, self.C = x.shape[1:]
+        W1, W2 = self.w, self.w // 2
+        self.s1, self.s2 = W1 / (W1 - 1), W2 / (W2 - 1)
+
+    def __call__(self, disp):
+        h, w = self.h, self.w
+        d = disp.reshape(h * w).contiguous()
+        o1 = torch.empty((h * w, 9), device=d.device, dtype=torch.half)
+        o2 = torch.empty((h * w, 9), device=d.device, dtype=torch.half)
+        k = kern()
+        nb = min((h * w + 7) // 8, 65535 * 4)
+        k.launch(
+            "cv_lookup_otf",
+            ((nb, 1, 1), (256, 1, 1)),
+            self.x,
+            self.ms,
+            self.g,
+            self.b,
+            d,
+            o1,
+            o2,
+            h,
+            w,
+            self.C,
+            self.s1,
+            0.5 * self.s2,
+            self.s2,
+        )
+
+        def f(c):
+            return c.view(1, h, w, 9).permute(0, 3, 1, 2)
+
+        return f(o1), f(o2)
 
 
 class FastCostVolume:
@@ -1178,6 +1412,26 @@ def _gru_forward_fused(self, h, x):
     return Hd
 
 
+def _gru_strips(gru, h, x):
+    """ConvGRU in row strips (halo 4: vertical 5x1 z|r conv, then q conv on r*h) -> new hidden; only one strip of the
+    GRU buffers alive (low-memory mode). Exact: zero padding at a strip edge only reaches the dropped halo rows."""
+    N, C, H, W = h.shape
+    halo = 4
+    rows = max(32, GRU_STRIP_BYTES // (2 * C * W * h.element_size()))
+    if H <= rows + 2 * halo:
+        return _gru_forward_fused(gru, h, x) if _OPT["cut"] else gru(h, x)
+    out = torch.empty_like(h, memory_format=CL)
+    for r0 in range(0, H, rows):
+        r1 = min(H, r0 + rows)
+        a, b = max(0, r0 - halo), min(H, r1 + halo)
+        hs, xs = _cl(h[:, :, a:b]), _cl(x[:, :, a:b])
+        y = _gru_forward_fused(gru, hs, xs) if _OPT["cut"] else gru(hs, xs)
+        out[:, :, r0:r1] = y[:, :, r0 - a : r0 - a + r1 - r0]
+        del y, hs, xs
+    gru._bufs = None
+    return out
+
+
 def _global_refiner_forward(self, ctx, disp, conf):
     mask = (conf > 0.2).float()
     conf_logit = (mask * conf).logit(eps=1e-1)
@@ -1196,11 +1450,26 @@ def _local_refiner_forward(self, hidden, ctx, disp, conf, occ, cv_fn):
     cf2 = run_seq(self.corr_feat2, c2 / 16)
     df = run_seq(self.disp_feat, _cl((disp / 1e2).half()))
     co = run_seq(self.conf_occ_feat, _cl(torch.cat([conf_logit, occ_logit], dim=1).half()))
-    x = run_seq(self.disp_corr_ctx_cat, torch.cat([df, cf1, cf2, ctx, co], dim=1))
+    if _LM[0]:  # cat + conv in row strips: no full-size concat buffer
+        k = max(m.kernel_size[0] for m in self.disp_corr_ctx_cat if isinstance(m, nn.Conv2d))
+        x = strips(
+            lambda *t: run_seq(self.disp_corr_ctx_cat, torch.cat([_cl(u) for u in t], dim=1)),
+            [df, cf1, cf2, ctx, co],
+            k // 2,
+        )
+    else:
+        x = run_seq(self.disp_corr_ctx_cat, torch.cat([df, cf1, cf2, ctx, co], dim=1))
     del df, cf1, cf2, co
     refine = self.refine_unet(x)[0]
     del x
-    hidden = _gru_forward_fused(self.gru, hidden, refine) if _OPT["cut"] else self.gru(hidden, refine)
+    if _LM[0]:
+        hidden = _gru_strips(self.gru, hidden, refine)
+    else:
+        hidden = (
+            _gru_forward_fused(self.gru, hidden, refine)
+            if _OPT["cut"]
+            else self.gru(hidden, refine)
+        )
     du = run_seq(self.disp_update, hidden).float()
     cu = run_seq(self.conf_occ_update, hidden).float()
     conf = torch.sigmoid(cu[:, 0:1] + conf_logit)
@@ -1296,36 +1565,62 @@ def forward_fast(self, img0, img1, full_outputs=True):
     if img0.shape[0] != 1 or img1.shape != img0.shape or img0.shape[1] != 3 or img0.shape[-2] % 32 or img0.shape[-1] % 32:
         raise ValueError(f"forward_fast: expects two [1, 3, H, W] images with H, W divisible by 32 (image_pad(x, 32)); "
                          f"got {tuple(img0.shape)} / {tuple(img1.shape)} (batch > 1: call once per pair)")
-    n0 = _cl(((img0 / 255. - .5) * 2).half())
-    n1 = _cl(((img1 / 255. - .5) * 2).half())
+    C = self.feature_channels
+    _LM[0] = _LOWMEM == "1" or (
+        _LOWMEM == "auto" and C * (img0.shape[-2] // 4) * (img0.shape[-1] // 4) * 2 > LOWMEM_BYTES
+    )
+    n0 = _cl(((img0 / 255.0 - 0.5) * 2).half())
+    n1 = _cl(((img1 / 255.0 - 0.5) * 2).half())
     f4_0, f2_0 = self.cnn_backbone(n0)
     # the 1/2-res left feature is only used by two convs of the upsampling heads (conv_y 3x3 -> 64 ch, conv_ctx 2x2/2 ->
     # 16 ch at full res): for C > 128 apply them now and drop the C-channel map (XL 12 MP: 2.4 GB held -> 0.8 GB). Exact.
     early = f2_0.shape[1] > 128
     if early:
-        f2_0 = (_cl(self.upsample_mask_4x_refine.conv_y(f2_0)), _cl(self.upsample_mask_1x.conv_ctx(f2_0)))
+        f2_0 = (
+            _cl(self.upsample_mask_4x_refine.conv_y(f2_0)),
+            _cl(self.upsample_mask_1x.conv_ctx(f2_0)),
+        )
+    if (
+        early and _LM[0]
+    ):  # low-memory: park the two upsampling-head maps in pinned host memory until the end
+        f2_0 = tuple(
+            torch.empty(t.permute(0, 2, 3, 1).shape, dtype=t.dtype, pin_memory=True).copy_(
+                t.permute(0, 2, 3, 1), non_blocking=True
+            )
+            for t in f2_0
+        )
     f4_1, _ = self.cnn_backbone(n1)
     del n1, _
     feature_4x = torch.cat([f4_0, f4_1], dim=0)
     del f4_0, f4_1
     py4, py8, py16, py32 = self.feat_pyramid(feature_4x)
     del feature_4x
-    tr4 = self.transformer(py4, py8, py16, py32)
-    del py8, py16, py32
+    if (
+        _INPLACE_ATTN
+    ):  # the transformer overwrites its inputs: keep image 0 of py4 (feature fusion) as a copy
+        py0 = py4[0:1].clone(memory_format=CL)
+        pl = [py4, py8, py16, py32]
+        del py4, py8, py16, py32
+        tr4 = self.transformer(pl)
+    else:
+        tr4 = self.transformer(py4, py8, py16, py32)
+        del py8, py16, py32
+        py0 = py4[0:1]
     disp, conf, occ, cv = self.disp_init(tr4)
     tr0 = tr4[0:1]
-    py0 = py4[0:1]
     disp = self.global_refiner(tr0, disp, conf)
     if self.use_positivity:
         disp = disp.clamp(min=0)
     fus = self.feat_fusion_layer(tr0, py0)
-    del tr4, py4, tr0, py0
+    del tr4, tr0, py0
     ctx0 = run_seq(self.ctx_feat, fus)
     del fus
     hidden = torch.tanh(ctx0)
     w = ctx0.shape[-1]
     coords = torch.arange(w, device=disp.device, dtype=torch.float32).view(1, 1, 1, w)
-    if os.environ.get("S2M2_CV") == "grid":   # ablation: upstream(-E) lookup via grid_sample (fp32 grid -> fp32 cv)
+    if os.environ.get("S2M2_CV") == "grid" and not isinstance(
+        cv, OtfCostVolume
+    ):  # ablation: upstream(-E) lookup via grid_sample (fp32 grid -> fp32 cv)
         from .submodules import CostVolume
 
         cvu = CostVolume(
@@ -1334,6 +1629,8 @@ def forward_fast(self, img0, img1, full_outputs=True):
 
         def cv_fn(d):
             return tuple(_cl(c.half()) for c in cvu(d))
+    elif isinstance(cv, OtfCostVolume):
+        cv_fn = cv
     else:
         cv_fn = FastCostVolume(cv, radius=4)
     del cv
@@ -1344,6 +1641,8 @@ def forward_fast(self, img0, img1, full_outputs=True):
         occ = occ * (coords - disp >= 0)
     del cv_fn
     self.refiner.gru._bufs = None
+    if early and f2_0[0].device.type == "cpu":
+        f2_0 = tuple(t.to(n0.device, non_blocking=True).permute(0, 3, 1, 2) for t in f2_0)
     mask4 = (
         self.upsample_mask_4x_refine(hidden, f2_0[0], True)
         if early

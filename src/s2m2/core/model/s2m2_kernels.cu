@@ -384,3 +384,291 @@ extern "C" __global__ void convex_up(const float* __restrict__ X, const __half* 
         }
     }
 }
+
+// ------------------------------------------------------------------------------------------------ on-the-fly cost volume
+// Refinement lookup without the [h, w, w] correlation volume: cv[y, i, j] = fp16(dot(f0[y, i, :], f1[y, j, :])) with
+// f = fp16(LayerNorm(x)) recomputed from the raw transformer output x [2, h, w, C] fp16 (per-pixel fp32 mean / rstd
+// in ms [2, h*w, 2], affine g, b fp32 [C]): only the ~20 right-image columns a pixel's 2 x 9 samples touch, fp32 dots
+// rounded to fp16 like the materialized cuBLAS volume. Same sample positions / interpolation / zero padding as
+// FastCostVolume (inference.py): level 1: x1 = (x*s1 - .5 - d*s1) + k*s1, level 2 (avg_pool1d(2) of cv, read as pair
+// means): x2 = (x*hs2 - .5 - d*hs2) + k*s2 (hs2 = .5*s2), k = -4..4; v = (v1 - v0) * t + v0. disp fp32 [h*w];
+// out1 / out2 fp16 [h*w, 9]. One warp per pixel (lane = channel pairs lane*2 + 64k); column dots cached in smem.
+#define OTF_MAXCOL 64
+template <int NC>
+__device__ __forceinline__ void otf_ln(const __half* __restrict__ xp, float mu, float rs, const float2* g, const float2* b,
+                                       int lane, float2* a) {
+    const __half2* x2 = reinterpret_cast<const __half2*>(xp) + lane;
+#pragma unroll
+    for (int k = 0; k < NC; ++k) {
+        float2 v = __half22float2(x2[k * 32]);
+        a[k].x = __half2float(__float2half_rn(__fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(v.x, mu), rs), g[k].x), b[k].x)));
+        a[k].y = __half2float(__float2half_rn(__fadd_rn(__fmul_rn(__fmul_rn(__fsub_rn(v.y, mu), rs), g[k].y), b[k].y)));
+    }
+}
+
+template <int NC>
+__device__ __forceinline__ float otf_dot(const __half* __restrict__ xr, float2 msr, const float2* g, const float2* b,
+                                         int lane, const float2* a) {
+    float2 f[NC];
+    otf_ln<NC>(xr, msr.x, msr.y, g, b, lane, f);
+    float s = 0.f;
+#pragma unroll
+    for (int k = 0; k < NC; ++k) {
+        s = fmaf(a[k].x, f[k].x, s);
+        s = fmaf(a[k].y, f[k].y, s);
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    return __half2float(__float2half_rn(s));
+}
+
+template <int NC>
+__device__ __forceinline__ void otf_body(const __half* __restrict__ x, const float2* __restrict__ ms,
+                                         const float* __restrict__ gw, const float* __restrict__ gb,
+                                         const float* __restrict__ disp, __half* __restrict__ out1, __half* __restrict__ out2,
+                                         int h, int w, int C, float s1, float hs2, float s2, float (*cache)[OTF_MAXCOL]) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int W2 = w >> 1;
+    const long long HW = (long long)h * w;
+    float2 g[NC], b[NC];
+#pragma unroll
+    for (int k = 0; k < NC; ++k) {
+        g[k] = make_float2(gw[lane * 2 + 64 * k], gw[lane * 2 + 64 * k + 1]);
+        b[k] = make_float2(gb[lane * 2 + 64 * k], gb[lane * 2 + 64 * k + 1]);
+    }
+    const __half* x1 = x + HW * C;
+    const float2* ms1 = ms + HW;
+    long long nwarps = (long long)gridDim.x * 8;
+    for (long long p = blockIdx.x * 8LL + warp; p < HW; p += nwarps) {
+        const int y = (int)(p / w), xq = (int)(p % w);
+        const float d = disp[p];
+        float2 a[NC];
+        { float2 m = ms[p]; otf_ln<NC>(x + p * C, m.x, m.y, g, b, lane, a); }
+        const float xf = (float)xq;
+        const float b1 = __fsub_rn(__fmul_rn(xf, s1), 0.5f), c1 = __fsub_rn(b1, __fmul_rn(d, s1));
+        const float b2 = __fsub_rn(__fmul_rn(xf, hs2), 0.5f), c2 = __fsub_rn(b2, __fmul_rn(d, hs2));
+        // column window touched by both levels (positions are monotone in k)
+        const int l1 = (int)floorf(__fadd_rn(c1, __fmul_rn(-4.f, s1))), h1 = (int)floorf(__fadd_rn(c1, __fmul_rn(4.f, s1))) + 1;
+        const int l2 = 2 * (int)floorf(__fadd_rn(c2, __fmul_rn(-4.f, s2))), h2 = 2 * ((int)floorf(__fadd_rn(c2, __fmul_rn(4.f, s2))) + 1) + 1;
+        const int jlo = max(0, min(l1, l2)), jhi = min(w - 1, max(h1, h2));
+        const int n = jhi - jlo + 1;
+        const long long rowp = (long long)y * w;
+        const bool cached = n <= OTF_MAXCOL;
+        if (cached) {
+            for (int j = 0; j < n; ++j) {
+                float v = otf_dot<NC>(x1 + (rowp + jlo + j) * C, ms1[rowp + jlo + j], g, b, lane, a);
+                if (lane == 0) cache[warp][j] = v;
+            }
+        }
+        __syncwarp();
+        // lanes 0..8: level 1 sample k = lane - 4; lanes 9..17: level 2. Uncached (n > 64, never for w >= 8): direct dots.
+        const bool lv1 = lane < 9;
+        const int kk = (lv1 ? lane : lane - 9) - 4;
+        const float xs = lv1 ? __fadd_rn(c1, __fmul_rn((float)kk, s1)) : __fadd_rn(c2, __fmul_rn((float)kk, s2));
+        const float x0 = floorf(xs), t = __fsub_rn(xs, x0);
+        const int i0 = (int)x0;
+        float v[2] = {0.f, 0.f};
+        if (cached && lane < 18) {
+            for (int q = 0; q < 2; ++q) {
+                int i = i0 + q;
+                if (lv1) { if (i >= 0 && i <= w - 1) v[q] = cache[warp][i - jlo]; }
+                else if (i >= 0 && i <= W2 - 1)
+                    v[q] = __fmul_rn(__fadd_rn(cache[warp][2 * i - jlo], cache[warp][2 * i + 1 - jlo]), 0.5f);
+            }
+        }
+        if (!cached) {   // slow path: every sample lane's columns, warp-wide dots
+            for (int src = 0; src < 18; ++src) {
+                int ii0 = __shfl_sync(0xffffffffu, i0, src);
+                bool l = src < 9;
+                for (int q = 0; q < 2; ++q) {
+                    int i = ii0 + q;
+                    float val = 0.f;
+                    if (l && i >= 0 && i <= w - 1)
+                        val = otf_dot<NC>(x1 + (rowp + i) * C, ms1[rowp + i], g, b, lane, a);
+                    else if (!l && i >= 0 && i <= W2 - 1)
+                        val = __fmul_rn(__fadd_rn(otf_dot<NC>(x1 + (rowp + 2 * i) * C, ms1[rowp + 2 * i], g, b, lane, a),
+                                                  otf_dot<NC>(x1 + (rowp + 2 * i + 1) * C, ms1[rowp + 2 * i + 1], g, b, lane, a)), 0.5f);
+                    if (lane == src) v[q] = val;
+                }
+            }
+        }
+        const float res = __fadd_rn(__fmul_rn(__fsub_rn(v[1], v[0]), t), v[0]);
+        if (lane < 9) out1[p * 9 + lane] = __float2half_rn(res);
+        else if (lane < 18) out2[p * 9 + lane - 9] = __float2half_rn(res);
+        __syncwarp();
+    }
+}
+
+extern "C" __global__ void cv_lookup_otf(const __half* __restrict__ x, const float2* __restrict__ ms,
+                                         const float* __restrict__ gw, const float* __restrict__ gb,
+                                         const float* __restrict__ disp, __half* __restrict__ out1, __half* __restrict__ out2,
+                                         int h, int w, int C, float s1, float hs2, float s2) {
+    __shared__ float cache[8][OTF_MAXCOL];
+    switch (C >> 6) {   // half2 per lane
+        case 1: otf_body<1>(x, ms, gw, gb, disp, out1, out2, h, w, C, s1, hs2, s2, cache); break;
+        case 2: otf_body<2>(x, ms, gw, gb, disp, out1, out2, h, w, C, s1, hs2, s2, cache); break;
+        case 3: otf_body<3>(x, ms, gw, gb, disp, out1, out2, h, w, C, s1, hs2, s2, cache); break;
+        case 4: otf_body<4>(x, ms, gw, gb, disp, out1, out2, h, w, C, s1, hs2, s2, cache); break;
+        case 6: otf_body<6>(x, ms, gw, gb, disp, out1, out2, h, w, C, s1, hs2, s2, cache); break;
+        default: otf_body<8>(x, ms, gw, gb, disp, out1, out2, h, w, C, s1, hs2, s2, cache); break;
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ attention, head_dim 384
+// Flash-style fused attention for S2M2-XL's 1-head level-0 attention (head_dim 384 > flash/SDPA's 256): o = softmax(q k^T
+// * scale) v for B = n*H independent sequences of length L. fp16 inputs, fp16-accumulate tensor-core MMAs for q k^T
+// and p v (the precision class of the explicit fp16-accumulate cuBLAS path it replaces), online softmax statistics in
+// fp32; p is pre-scaled by 2^-5 so the fp16 accumulator of sum_j p_j v_j has 32x headroom (unnormalized p <= 1).
+// Block = 4 warps x 16 query rows; key tiles of 32 rows (K and V tiles in shared memory, cp.async, single buffered
+// with the V load overlapping q k^T and the next K load overlapping p v). q fragments live in registers.
+// Strides (elements): sequence b = (b / H) * sn + (b % H) * sh, row l * sl (q, k, v share them; o has its own).
+#define AT_D 384
+#define AT_BN 32
+#define AT_LD (AT_D + 8)
+__device__ __forceinline__ void cp16(void* s, const void* g, bool ok) {
+    unsigned sa = (unsigned)__cvta_generic_to_shared(s);
+    int n = ok ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sa), "l"(g), "r"(n));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+__device__ __forceinline__ void ldm_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const void* p) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+__device__ __forceinline__ void ldm_x4t(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, const void* p) {
+    unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+__device__ __forceinline__ void mma16(unsigned* c, const unsigned* a, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<unsigned*>(&h); }
+__device__ __forceinline__ __half2 u2h(unsigned u) { return *reinterpret_cast<__half2*>(&u); }
+
+extern "C" __global__ void __launch_bounds__(128) attn_d384(
+        const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v, __half* __restrict__ o,
+        long long sn, long long sh, long long sl, long long osn, long long osh, long long osl, int H, int L, float scale) {
+    extern __shared__ __align__(16) __half smem[];
+    __half* sK = smem;                    // [AT_BN][AT_LD]
+    __half* sV = smem + AT_BN * AT_LD;    // [AT_BN][AT_LD]   (sK | sV = [64][AT_LD] q staging at start)
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int b = blockIdx.y, m0 = blockIdx.x * 64;
+    const long long base = (long long)(b / H) * sn + (long long)(b % H) * sh;
+    const long long obase = (long long)(b / H) * osn + (long long)(b % H) * osh;
+    const __half* qb = q + base; const __half* kb = k + base; const __half* vb = v + base;
+    // q tile -> smem -> registers
+    for (int c = tid; c < 64 * (AT_D / 8); c += 128) {
+        int r = c / (AT_D / 8), cc = (c % (AT_D / 8)) * 8;
+        bool ok = m0 + r < L;
+        cp16(smem + r * AT_LD + cc, qb + (long long)(ok ? m0 + r : 0) * sl + cc, ok);
+    }
+    cp_commit(); cp_wait<0>(); __syncthreads();
+    unsigned qf[AT_D / 16][4];
+#pragma unroll
+    for (int kk = 0; kk < AT_D / 16; ++kk)
+        ldm_x4(qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], smem + (warp * 16 + (lane & 15)) * AT_LD + kk * 16 + (lane >> 4) * 8);
+    __syncthreads();
+    auto load_tile = [&](__half* s, const __half* g, int n0) {
+        for (int c = tid; c < AT_BN * (AT_D / 8); c += 128) {
+            int r = c / (AT_D / 8), cc = (c % (AT_D / 8)) * 8;
+            bool ok = n0 + r < L;
+            cp16(s + r * AT_LD + cc, g + (long long)(ok ? n0 + r : 0) * sl + cc, ok);
+        }
+        cp_commit();
+    };
+    unsigned oacc[AT_D / 8][2];
+#pragma unroll
+    for (int i = 0; i < AT_D / 8; ++i) { oacc[i][0] = 0u; oacc[i][1] = 0u; }
+    float mA = -INFINITY, mB = -INFINITY, lA = 0.f, lB = 0.f;
+    const float sc = scale * 1.4426950408889634f;   // exp2 domain
+    const int T = (L + AT_BN - 1) / AT_BN;
+    load_tile(sK, kb, 0);
+    for (int t = 0; t < T; ++t) {
+        const int n0 = t * AT_BN;
+        load_tile(sV, vb, n0);
+        cp_wait<1>(); __syncthreads();             // K tile t ready
+        unsigned s[AT_BN / 8][2];
+#pragma unroll
+        for (int i = 0; i < AT_BN / 8; ++i) { s[i][0] = 0u; s[i][1] = 0u; }
+#pragma unroll
+        for (int kk = 0; kk < AT_D / 16; ++kk) {
+#pragma unroll
+            for (int np = 0; np < AT_BN / 16; ++np) {
+                unsigned b0, b1, b2, b3;
+                const int mid = lane >> 3;
+                ldm_x4(b0, b1, b2, b3, sK + (np * 16 + (mid >> 1) * 8 + (lane & 7)) * AT_LD + kk * 16 + (mid & 1) * 8);
+                mma16(s[2 * np], qf[kk], b0, b1);
+                mma16(s[2 * np + 1], qf[kk], b2, b3);
+            }
+        }
+        __syncthreads();                           // all warps done with sK
+        if (t + 1 < T) load_tile(sK, kb, n0 + AT_BN);
+        // online softmax (rows A = lane/4, B = lane/4 + 8 of the warp's 16)
+        float pa[AT_BN / 8][2], pb[AT_BN / 8][2];
+        float mxA = -INFINITY, mxB = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < AT_BN / 8; ++i) {
+            float2 xa = __half22float2(u2h(s[i][0])), xb = __half22float2(u2h(s[i][1]));
+            int c = n0 + i * 8 + (lane & 3) * 2;
+            pa[i][0] = c < L ? xa.x * sc : -INFINITY; pa[i][1] = c + 1 < L ? xa.y * sc : -INFINITY;
+            pb[i][0] = c < L ? xb.x * sc : -INFINITY; pb[i][1] = c + 1 < L ? xb.y * sc : -INFINITY;
+            mxA = fmaxf(mxA, fmaxf(pa[i][0], pa[i][1])); mxB = fmaxf(mxB, fmaxf(pb[i][0], pb[i][1]));
+        }
+#pragma unroll
+        for (int off = 1; off <= 2; off <<= 1) {
+            mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffffu, mxA, off));
+            mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffffu, mxB, off));
+        }
+        const float nA = fmaxf(mA, mxA), nB = fmaxf(mB, mxB);
+        const float aA = exp2f(mA - nA), aB = exp2f(mB - nB);   // mA = -inf at t = 0 -> 0
+        mA = nA; mB = nB;
+        float rsA = 0.f, rsB = 0.f;
+        unsigned pf[AT_BN / 8][2];
+#pragma unroll
+        for (int i = 0; i < AT_BN / 8; ++i) {
+            float p0 = exp2f(pa[i][0] - nA - 5.f), p1 = exp2f(pa[i][1] - nA - 5.f);
+            float p2 = exp2f(pb[i][0] - nB - 5.f), p3 = exp2f(pb[i][1] - nB - 5.f);
+            __half2 ha = __floats2half2_rn(p0, p1), hb = __floats2half2_rn(p2, p3);
+            float2 fa = __half22float2(ha), fb = __half22float2(hb);   // row sums of the rounded p (consistent with p v)
+            rsA += fa.x + fa.y; rsB += fb.x + fb.y;
+            pf[i][0] = h2u(ha); pf[i][1] = h2u(hb);
+        }
+        rsA += __shfl_xor_sync(0xffffffffu, rsA, 1); rsA += __shfl_xor_sync(0xffffffffu, rsA, 2);
+        rsB += __shfl_xor_sync(0xffffffffu, rsB, 1); rsB += __shfl_xor_sync(0xffffffffu, rsB, 2);
+        lA = lA * aA + rsA; lB = lB * aB + rsB;
+        if (t > 0) {
+            const __half2 hA = __float2half2_rn(aA), hB = __float2half2_rn(aB);
+#pragma unroll
+            for (int i = 0; i < AT_D / 8; ++i) {
+                oacc[i][0] = h2u(__hmul2(u2h(oacc[i][0]), hA));
+                oacc[i][1] = h2u(__hmul2(u2h(oacc[i][1]), hB));
+            }
+        }
+        if (t + 1 < T) cp_wait<1>(); else cp_wait<0>();
+        __syncthreads();                           // V tile t ready
+#pragma unroll
+        for (int j = 0; j < AT_BN / 16; ++j) {
+            unsigned a[4] = {pf[2 * j][0], pf[2 * j][1], pf[2 * j + 1][0], pf[2 * j + 1][1]};
+#pragma unroll
+            for (int np = 0; np < AT_D / 16; ++np) {
+                unsigned b0, b1, b2, b3;
+                const int mid = lane >> 3;
+                ldm_x4t(b0, b1, b2, b3, sV + (j * 16 + (mid & 1) * 8 + (lane & 7)) * AT_LD + np * 16 + (mid >> 1) * 8);
+                mma16(oacc[2 * np], a, b0, b1);
+                mma16(oacc[2 * np + 1], a, b2, b3);
+            }
+        }
+        __syncthreads();                           // all warps done with sV
+    }
+    const int rA = m0 + warp * 16 + (lane >> 2), rB = rA + 8;
+    const float iA = 1.f / lA, iB = 1.f / lB;
+#pragma unroll
+    for (int i = 0; i < AT_D / 8; ++i) {
+        const int c = i * 8 + (lane & 3) * 2;
+        float2 xa = __half22float2(u2h(oacc[i][0])), xb = __half22float2(u2h(oacc[i][1]));
+        if (rA < L) *reinterpret_cast<__half2*>(o + obase + (long long)rA * osl + c) = __floats2half2_rn(xa.x * iA, xa.y * iA);
+        if (rB < L) *reinterpret_cast<__half2*>(o + obase + (long long)rB * osl + c) = __floats2half2_rn(xb.x * iB, xb.y * iB);
+    }
+}

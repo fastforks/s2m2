@@ -38,6 +38,8 @@ SIGNATURES = {
     "gn_stats": "pplii",
     "affine_nc8": "pppli" + "i",
     "convex_up": "pppiiii",
+    "cv_lookup_otf": "pppppppiiifff",
+    "attn_d384": "ppppllllllii" + "f",
 }
 _STRUCT = {"p": "P", "i": "i", "l": "q", "f": "f", "u": "I"}
 _FMT = {}
@@ -119,6 +121,7 @@ class Kernels:
             self.lib.cuModuleLoadData(ctypes.byref(self.module), self._image), "cuModuleLoadData"
         )
         self.funcs = {}
+        self._smem = {}
         for name in SIGNATURES:
             f = ctypes.c_void_p()
             _check(
@@ -132,7 +135,7 @@ class Kernels:
         """Rust's Launch::linear: 256 threads, grid-stride loops, at most 65535*8 blocks."""
         return (min(max((n + 255) // 256, 1), 65535 * 8), 1, 1), (256, 1, 1)
 
-    def launch(self, name, cfg, *args):
+    def launch(self, name, cfg, *args, smem=0):
         """Arguments packed into one C-layout buffer (CU_LAUNCH_PARAM_BUFFER_POINTER): ~3x less Python overhead than
         one ctypes object per argument."""
         grid, block = cfg
@@ -145,10 +148,38 @@ class Kernels:
         ]
         buf = struct.pack(fmt, *vals)
         size = ctypes.c_size_t(len(buf))
-        extra = (ctypes.c_void_p * 5)(1, ctypes.cast(ctypes.c_char_p(buf), ctypes.c_void_p).value,
-                                      2, ctypes.addressof(size), 0)
-        _check(self.lib.cuLaunchKernel(self.funcs[name], grid[0], grid[1], grid[2], block[0], block[1], block[2], 0,
-                                       _stream(), None, extra), f"launch {name}")
+        extra = (ctypes.c_void_p * 5)(
+            1,
+            ctypes.cast(ctypes.c_char_p(buf), ctypes.c_void_p).value,
+            2,
+            ctypes.addressof(size),
+            0,
+        )
+        if (
+            smem > 48 * 1024 and self._smem.get(name, 0) < smem
+        ):  # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            _check(
+                self.lib.cuFuncSetAttribute(self.funcs[name], 8, ctypes.c_int(smem)),
+                "cuFuncSetAttribute",
+            )
+            self._smem[name] = smem
+        _check(
+            self.lib.cuLaunchKernel(
+                self.funcs[name],
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                smem,
+                _stream(),
+                None,
+                extra,
+            ),
+            f"launch {name}",
+        )
+
 
 if __name__ == "__main__":
     print(build_prebuilt())
