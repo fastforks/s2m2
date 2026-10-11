@@ -1,3 +1,32 @@
+# S2M2: faster inference fork
+
+> **You are on `portable`.** Research fork of [junhong-3dv/s2m2](https://github.com/junhong-3dv/s2m2) (base `8f3bd78`, 2026-04-28; `main` mirrors upstream). Two branches:
+> - [`portable`](https://github.com/fastforks/s2m2/tree/portable): plain PyTorch, exports to ONNX / TensorRT, no build step.
+> - [`cuda-kernels`](https://github.com/fastforks/s2m2/tree/cuda-kernels): `portable` plus custom CUDA kernels (prebuilt for sm_80/86/89/90/120; fp16-accumulate convs need `pip install nvidia-cudnn-frontend`).
+>
+> `portable` includes a correctness fix for upstream's +0.5 px lookup bug (S ETH3D EPE 0.315 -> 0.193), which costs a little speed in plain PyTorch.
+> Licence, as upstream: code CC BY-NC 4.0 · weights CC BY-NC 4.0
+
+S2M2-S, released weights, fp16 autocast, refine_iter 3; RTX 5060 Ti 16 GB, torch 2.14.1+cu130, TensorRT 11.4, 2026-10-10. Median of 10 runs; memory = torch peak allocated / reserved (TensorRT: context memory).
+
+| version | KITTI ms | Midd-H ms | Midd-F ms | speed-up at H | peak MB at H (alloc / reserved) | peak MB at F (alloc / reserved) | startup / new size | ETH3D EPE | Midd-H EPE |
+|---|---|---|---|---|---|---|---|---|---|
+| upstream | 89 | 340 | 1707 | 1.00x | 1700 / 2516 | 9003 / 12576 | 7.4 s / 2.7 s | 0.315 | 0.833 |
+| **portable** | 91.8 | 350.3 | 1670 | 0.97x | 1742 / 2572 | 8195 / 12006 | 2.85 s / 28 ms | 0.193 | 0.652 |
+| portable → TensorRT | 40.9 | 136.6 | 660 | 2.49x | ctx 949 | 8152 / 8778 | 1.6 s / none | 0.193 | 0.653 |
+| **cuda-kernels** | 36.5 | 111.4 | 511 | 3.05x | 802 / 1322 | 2612 / 4428 | 2.2 s / 112 ms | 0.193 | 0.652 |
+
+S2M2-XL:
+
+| version | KITTI ms | Midd-H ms | Midd-F ms | speed-up at H | peak MB at H (alloc / reserved) | peak MB at F (alloc / reserved) | startup / new size | ETH3D EPE | Midd-H EPE |
+|---|---|---|---|---|---|---|---|---|---|
+| upstream | 520 | 1765 | out of memory | 1.00x | 5241 / 7068 | out of memory | 11.3 s / 6.4 s | 0.190 | 0.553 |
+| **portable** | 535.3 | 1817 | out of memory | 0.97x | 5324 / 7920 | out of memory | 3.0 s / 1 ms | 0.147 | 0.499 |
+| portable → TensorRT | 237.2 | 767.5 | 3599 | 2.30x | ctx 2735 | ctx 10700 | 4.4 s / none | 0.150 | 0.502 |
+| **cuda-kernels** | 213.6 | 683.8 | 3016 | 2.58x | 4000 / 4748 | 7328 / 9148 | 2.9 s / 31 ms | 0.149 | 0.499 |
+
+---
+
 <div align="center">
 <h3>S<sup>2</sup>M<sup>2</sup>: Scalable Stereo Matching Model for Reliable Depth Estimation (ICCV 2025)</h3>
 <h5>Junhong Min¹<sup>*</sup>, Youngpil Jeon¹, Jimin Kim¹, Minyong Choi¹</h5>
