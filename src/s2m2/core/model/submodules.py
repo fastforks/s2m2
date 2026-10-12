@@ -16,6 +16,8 @@ def bilinear_sampler(img, coords, mode='bilinear'):
     xgrid = 2 * xgrid / (W - 1) - 1
     ygrid = 2 * ygrid / (H - 1) - 1
     grid = torch.cat([xgrid, ygrid], dim=-1)
+    if not torch.is_autocast_enabled(img.device.type):
+        grid = grid.to(img.dtype)  # grid_sample needs matching dtypes; under autocast it runs in fp32 itself
     out = F.grid_sample(img, grid, mode=mode, align_corners=True)
 
     return out
