@@ -9,21 +9,25 @@
 
 S2M2-S, released weights, fp16 autocast, refine_iter 3; RTX 5060 Ti 16 GB, torch 2.14.1+cu130, TensorRT 11.4, 2026-10-10. Median of 10 runs; memory = torch peak allocated / reserved (TensorRT: context memory).
 
-| version | KITTI ms | Midd-H ms | Midd-F ms | speed-up at H | peak MB at H (alloc / reserved) | peak MB at F (alloc / reserved) | startup / new size | ETH3D EPE | Midd-H EPE |
+| version | KITTI ms | Midd-H ms | Midd-F ms | speed-up at H (vs flags / vs upstream) | peak MB at H (alloc / reserved) | peak MB at F (alloc / reserved) | startup / new size | ETH3D EPE | Midd-H EPE |
 |---|---|---|---|---|---|---|---|---|---|
-| upstream | 89 | 340 | 1707 | 1.00x | 1700 / 2516 | 9003 / 12576 | 7.4 s / 2.7 s | 0.315 | 0.833 |
-| **portable** | 91.8 | 350.3 | 1670 | 0.97x | 1742 / 2572 | 8195 / 12006 | 2.85 s / 28 ms | 0.193 | 0.652 |
-| portable → TensorRT | 40.9 | 136.6 | 660 | 2.49x | ctx 949 | 8152 / 8778 | 1.6 s / none | 0.193 | 0.653 |
-| **cuda-kernels** | 36.5 | 111.4 | 511 | 3.05x | 802 / 1322 | 2612 / 4428 | 2.2 s / 112 ms | 0.193 | 0.652 |
+| upstream (fp16 autocast) | 89 | 340 | 1707 | 0.77x / 1.00x | 1700 / 2516 | 9003 / 12576 | 7.4 s / 2.7 s | 0.315 | 0.833 |
+| upstream + flags (`model.half()`, channels_last, `cudnn.benchmark`, TF32, `inference_mode`) | 67.0 | 263 | - | 1.00x / 1.29x | 1285 / 1594 | - | 3.1 s / 2.0 s | 0.316 | 0.833 |
+| **portable** | 91.8 | 350.3 | 1670 | 0.75x / 0.97x | 1742 / 2572 | 8195 / 12006 | 2.85 s / 28 ms | 0.193 | 0.652 |
+| portable → TensorRT | 40.9 | 136.6 | 660 | 1.93x / 2.49x | ctx 949 | 8152 / 8778 | 1.6 s / none | 0.193 | 0.653 |
+| **cuda-kernels** | 36.5 | 111.4 | 511 | 2.36x / 3.05x | 802 / 1322 | 2612 / 4428 | 2.2 s / 112 ms | 0.193 | 0.652 |
 
 S2M2-XL:
 
-| version | KITTI ms | Midd-H ms | Midd-F ms | speed-up at H | peak MB at H (alloc / reserved) | peak MB at F (alloc / reserved) | startup / new size | ETH3D EPE | Midd-H EPE |
+| version | KITTI ms | Midd-H ms | Midd-F ms | speed-up at H (vs flags / vs upstream) | peak MB at H (alloc / reserved) | peak MB at F (alloc / reserved) | startup / new size | ETH3D EPE | Midd-H EPE |
 |---|---|---|---|---|---|---|---|---|---|
-| upstream | 520 | 1765 | out of memory | 1.00x | 5241 / 7068 | out of memory | 11.3 s / 6.4 s | 0.190 | 0.553 |
-| **portable** | 535.3 | 1817 | out of memory | 0.97x | 5324 / 7920 | out of memory | 3.0 s / 1 ms | 0.147 | 0.499 |
-| portable → TensorRT | 237.2 | 767.5 | 3599 | 2.30x | ctx 2735 | ctx 10700 | 4.4 s / none | 0.150 | 0.502 |
-| **cuda-kernels** | 213.6 | 683.8 | 3016 | 2.58x | 4000 / 4748 | 7328 / 9148 | 2.9 s / 31 ms | 0.149 | 0.499 |
+| upstream (fp16 autocast) | 520 | 1765 | out of memory | 0.83x / 1.00x | 5241 / 7068 | out of memory | 11.3 s / 6.4 s | 0.190 | 0.553 |
+| upstream + flags (`model.half()`, channels_last, `cudnn.benchmark`, TF32, `inference_mode`) | 413.5 | 1457 | - | 1.00x / 1.21x | 3546 / 4208 | - | 4.1 s / 4.7 s | 0.189 | 0.553 |
+| **portable** | 535.3 | 1817 | out of memory | 0.80x / 0.97x | 5324 / 7920 | out of memory | 3.0 s / 1 ms | 0.147 | 0.499 |
+| portable → TensorRT | 237.2 | 767.5 | 3599 | 1.90x / 2.30x | ctx 2735 | ctx 10700 | 4.4 s / none | 0.150 | 0.502 |
+| **cuda-kernels** | 213.6 | 683.8 | 3016 | 2.13x / 2.58x | 4000 / 4748 | 7328 / 9148 | 2.9 s / 31 ms | 0.149 | 0.499 |
+
+Flags rows: driver-side only, no source edit (upstream already runs fp16 autocast and sets `cudnn.benchmark` in its demo). Tried on top of `inference_mode` + `cudnn.benchmark` + TF32: autocast only (S 340 / XL 1766 ms at Midd-H: no change), + channels_last (298 / 1657), `model.half()` (306 / 1566), `model.half()` + channels_last (the rows: 263 / 1457); EPE within 0.001 px of upstream in all. `portable` and `cuda-kernels` also fix upstream's lookup bug (EPE differs), so their speed-up is not a like-for-like comparison with the flags rows. Start-up / new size include the `cudnn.benchmark` autotune; Midd-F not measured (`-`). Raw: `results/2026-10-23_flags_older_forks/` of the publishing workspace.
 
 ---
 
